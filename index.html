@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WiFi Mapper | Gemini Edition</title>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.11/html-to-image.min.js"></script>
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500&display=swap');
+        
+        body { 
+            font-family: 'Google Sans', sans-serif;
+            background-color: #1e1f20;
+            color: #e3e3e3;
+            margin: 0;
+            overflow: hidden;
+        }
+
+        /* Кастомный скроллбар в стиле Google */
+        .custom-scroll::-webkit-scrollbar { width: 8px; }
+        .custom-scroll::-webkit-scrollbar-track { background: transparent; }
+        .custom-scroll::-webkit-scrollbar-thumb { background: #3c4043; border-radius: 10px; }
+        .custom-scroll::-webkit-scrollbar-thumb:hover { background: #5f6368; }
+
+        .sidebar-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 16px;
+            border-radius: 20px;
+            cursor: pointer;
+            transition: all 0.2s;
+            color: #c4c7c5;
+        }
+        .sidebar-item:hover { background-color: #333537; color: white; }
+        .sidebar-item.active { background-color: #333537; color: white; }
+
+        .map-viewport {
+            cursor: grab;
+            touch-action: none;
+            background-image: radial-gradient(#333537 1px, transparent 1px);
+            background-size: 20px 20px;
+        }
+        .map-viewport:active { cursor: grabbing; }
+
+        .gemini-input {
+            background: #1e1f20;
+            border: 1px solid #444746;
+            border-radius: 12px;
+            padding: 8px 12px;
+            color: white;
+            outline: none;
+        }
+        .gemini-input:focus { border-color: #a8c7fa; }
+
+        .snow-overlay {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none;
+            z-index: 100;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useCallback, useRef, useEffect } = React;
+
+        // --- Иконки Lucide ---
+        const Icon = ({ name, size = 20, className = "" }) => {
+            useEffect(() => { if (window.lucide) window.lucide.createIcons(); }, [name]);
+            return <i data-lucide={name} style={{width: size, height: size}} className={className}></i>;
+        };
+
+        // --- Снег ---
+        const Snowfall = ({ active }) => {
+            const canvasRef = useRef(null);
+            useEffect(() => {
+                if (!active) return;
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+                const flakes = Array.from({length: 100}, () => ({
+                    x: Math.random() * canvas.width,
+                    y: Math.random() * canvas.height,
+                    r: Math.random() * 3 + 1,
+                    v: Math.random() * 2 + 0.5
+                }));
+                let anim;
+                const loop = () => {
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    ctx.fillStyle = 'white';
+                    flakes.forEach(f => {
+                        f.y += f.v;
+                        if (f.y > canvas.height) f.y = -10;
+                        ctx.beginPath();
+                        ctx.arc(f.x, f.y, f.r, 0, Math.PI*2);
+                        ctx.fill();
+                    });
+                    anim = requestAnimationFrame(loop);
+                };
+                loop();
+                return () => cancelAnimationFrame(anim);
+            }, [active]);
+            return active ? <canvas ref={canvasRef} className="snow-overlay" /> : null;
+        };
+
+        const App = () => {
+            const [image, setImage] = useState(null);
+            const [points, setPoints] = useState([]);
+            const [selectedId, setSelectedId] = useState(null);
+            const [isSnowing, setIsSnowing] = useState(false);
+            
+            // Состояние камеры (Zoom & Pan)
+            const [scale, setScale] = useState(1);
+            const [pos, setPos] = useState({ x: 0, y: 0 });
+            const [isDragging, setIsDragging] = useState(false);
+            const [mode, setMode] = useState('move'); // 'move' или 'add'
+
+            const mapRef = useRef(null);
+            const dragStart = useRef({ x: 0, y: 0 });
+
+            // Обработка загрузки
+            const onUpload = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                const reader = new FileReader();
+                reader.onload = (ev) => setImage(ev.target.result);
+                reader.readAsDataURL(file);
+            };
+
+            // Zoom колесиком
+            const handleWheel = (e) => {
+                e.preventDefault();
+                const delta = e.deltaY > 0 ? 0.9 : 1.1;
+                setScale(s => Math.min(Math.max(s * delta, 0.1), 10));
+            };
+
+            // Pan (перемещение)
+            const handleMouseDown = (e) => {
+                if (mode === 'move' && e.button === 0) {
+                    setIsDragging(true);
+                    dragStart.current = { x: e.clientX - pos.x, y: e.clientY - pos.y };
+                }
+            };
+
+            const handleMouseMove = (e) => {
+                if (isDragging) {
+                    setPos({ x: e.clientX - dragStart.current.x, y: e.clientY - dragStart.current.y });
+                }
+            };
+
+            const handleMouseUp = () => setIsDragging(false);
+
+            // Клик по карте (добавление точки)
+            const handleMapClick = (e) => {
+                if (mode === 'move' && !isDragging) return;
+                if (!image || !mapRef.current) return;
+
+                const rect = mapRef.current.getBoundingClientRect();
+                const x = ((e.clientX - rect.left) / (rect.width)) * 100;
+                const y = ((e.clientY - rect.top) / (rect.height)) * 100;
+
+                const newId = points.length > 0 ? Math.max(...points.map(p => p.id)) + 1 : 1;
+                setPoints([...points, { id: newId, x, y, dbm: '' }]);
+                setSelectedId(newId);
+                if (mode === 'add') setMode('move'); // Авто-возврат в режим перемещения
+            };
+
+            const handleExport = async () => {
+                const dataUrl = await htmlToImage.toPng(mapRef.current);
+                const link = document.createElement('a');
+                link.download = 'wifi-map.png';
+                link.href = dataUrl;
+                link.click();
+            };
+
+            return (
+                <div className="flex h-screen w-screen bg-[#1e1f20] text-[#e3e3e3]">
+                    <Snowfall active={isSnowing} />
+
+                    {/* Левый сайдбар в стиле Gemini */}
+                    <aside className="w-[280px] bg-[#131314] flex flex-col p-4 z-50">
+                        <div className="flex items-center gap-3 px-4 mb-8">
+                            <div className="w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center">
+                                <Icon name="zap" size={20} className="text-white" />
+                            </div>
+                            <span className="text-xl font-medium tracking-tight">WiFi Mapper</span>
+                        </div>
+
+                        <nav className="flex-1 space-y-2">
+                            <div className={`sidebar-item ${!isSnowing ? 'active' : ''}`} onClick={() => setIsSnowing(false)}>
+                                <Icon name="map" />
+                                <span>Карта сигнала</span>
+                            </div>
+                            <div className={`sidebar-item ${isSnowing ? 'active' : ''}`} onClick={() => setIsSnowing(true)}>
+                                <Icon name="snowflake" />
+                                <span>Let it snow</span>
+                            </div>
+                        </nav>
+
+                        <div className="pt-4 border-t border-[#444746] space-y-1">
+                            <div className="sidebar-item">
+                                <Icon name="key" />
+                                <span>Get API key</span>
+                            </div>
+                            <div className="sidebar-item">
+                                <Icon name="settings" />
+                                <span>Settings</span>
+                            </div>
+                            <div className="sidebar-item mt-4">
+                                <div className="w-8 h-8 rounded-full bg-gradient-to-r from-purple-500 to-pink-500 flex items-center justify-center text-[10px] font-bold">
+                                    USER
+                                </div>
+                                <span className="text-sm">gt60m@mail.ru</span>
+                            </div>
+                        </div>
+                    </aside>
+
+                    {/* Основная рабочая область */}
+                    <main className="flex-1 flex flex-col relative overflow-hidden">
+                        
+                        {/* Область карты */}
+                        <div 
+                            className="flex-1 map-viewport overflow-hidden relative"
+                            onWheel={handleWheel}
+                            onMouseDown={handleMouseDown}
+                            onMouseMove={handleMouseMove}
+                            onMouseUp={handleMouseUp}
+                            onMouseLeave={handleMouseUp}
+                            onClick={(e) => mode === 'add' && handleMapClick(e)}
+                        >
+                            {!image ? (
+                                <div className="h-full flex flex-col items-center justify-center text-center p-10">
+                                    <h2 className="text-4xl font-medium mb-6">Чем я могу помочь?</h2>
+                                    <label className="bg-[#333537] hover:bg-[#444746] px-8 py-4 rounded-full cursor-pointer flex items-center gap-3 transition-all border border-[#444746]">
+                                        <Icon name="image-plus" />
+                                        <span>Загрузите план помещения</span>
+                                        <input type="file" className="hidden" onChange={onUpload} accept="image/*" />
+                                    </label>
+                                </div>
+                            ) : (
+                                <div 
+                                    ref={mapRef}
+                                    className="absolute transition-transform duration-75"
+                                    style={{ 
+                                        transform: `translate(${pos.x}px, ${pos.y}px) scale(${scale})`,
+                                        transformOrigin: '0 0',
+                                        width: 'fit-content'
+                                    }}
+                                >
+                                    <img src={image} className="block max-h-[85vh] w-auto pointer-events-none select-none" />
+                                    {points.map(p => (
+                                        <div 
+                                            key={p.id}
+                                            onClick={(e) => { e.stopPropagation(); setSelectedId(p.id); }}
+                                            style={{ left: `${p.x}%`, top: `${p.y}%` }}
+                                            className={`absolute -translate-x-1/2 -translate-y-1/2 w-8 h-8 rounded-full flex items-center justify-center border-2 transition-all cursor-pointer shadow-lg ${
+                                                selectedId === p.id ? 'bg-[#a8c7fa] border-white text-black scale-125 z-20' : 'bg-[#131314] border-[#a8c7fa] text-[#a8c7fa]'
+                                            }`}
+                                        >
+                                            <span className="text-[10px] font-bold">{p.id}</span>
+                                            {p.dbm && <div className="absolute top-10 bg-[#333537] text-[10px] px-2 py-1 rounded border border-[#444746]">{p.dbm} dBm</div>}
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Нижняя панель управления (Инпут-бар Gemini) */}
+                        {image && (
+                            <div className="p-6 bg-[#1e1f20]">
+                                <div className="max-w-4xl mx-auto bg-[#131314] rounded-[32px] p-2 pl-6 flex items-center gap-4 border border-[#444746]">
+                                    <button 
+                                        onClick={() => setMode(mode === 'move' ? 'add' : 'move')}
+                                        className={`p-3 rounded-full transition-colors ${mode === 'add' ? 'bg-blue-500 text-white' : 'hover:bg-[#333537]'}`}
+                                        title="Режим добавления точек"
+                                    >
+                                        <Icon name="map-pin" />
+                                    </button>
+                                    
+                                    <div className="flex-1 flex gap-4 overflow-x-auto custom-scroll py-2">
+                                        {points.length === 0 ? (
+                                            <span className="text-[#8e918f]">Выберите режим «Метка» слева и кликните на карту...</span>
+                                        ) : (
+                                            points.map(p => (
+                                                <div key={p.id} className={`flex items-center gap-2 min-w-fit px-3 py-1 rounded-xl border ${selectedId === p.id ? 'border-[#a8c7fa] bg-[#1e1f20]' : 'border-[#444746]'}`}>
+                                                    <span className="text-xs font-bold text-[#a8c7fa]">{p.id}:</span>
+                                                    <input 
+                                                        className="w-12 bg-transparent outline-none text-sm"
+                                                        placeholder="dBm"
+                                                        value={p.dbm}
+                                                        onChange={(e) => setPoints(points.map(pt => pt.id === p.id ? {...pt, dbm: e.target.value} : pt))}
+                                                    />
+                                                </div>
+                                            ))
+                                        )}
+                                    </div>
+
+                                    <button onClick={handleExport} className="bg-[#a8c7fa] text-[#062e6f] px-6 py-3 rounded-full font-medium hover:bg-[#d3e3fd] transition-colors flex items-center gap-2">
+                                        <Icon name="download" size={18} />
+                                        <span>Экспорт</span>
+                                    </button>
+                                </div>
+                                <p className="text-center text-[11px] text-[#8e918f] mt-3">
+                                    WiFi Mapper может ошибаться. Проверяйте уровни затухания сигнала в мертвых зонах.
+                                </p>
+                            </div>
+                        )}
+                    </main>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
